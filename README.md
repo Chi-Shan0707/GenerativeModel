@@ -65,3 +65,34 @@ Further reading
 If you want, I can:
 - Run a short training job locally and save an example checkpoint + samples.
 - Reduce model size further or add more comments to any file.
+
+## Debug Notes
+
+- What was wrong:
+  - The initial `SmallUNet` concatenated the timestep embedding into the
+    bottleneck feature map, which doubled the number of channels unexpectedly.
+    That caused `ConvTranspose2d` in the decoder to receive inputs with the
+    wrong channel size and raised runtime shape errors.
+  - The `_extract` helper previously attempted to `gather` and `view` into the
+    full broadcast shape which could fail when shapes didn't align exactly.
+
+- How it was fixed:
+  - `model.py`: project the timestep embedding to the same number of
+    bottleneck channels and *add* it to the bottleneck features instead of
+    concatenating. This preserves channel counts and keeps skip-connections
+    aligned with decoder expectations.
+  - `diffusion.py`: `_extract` now indexes the 1-D schedule with the
+    batch timesteps and reshapes/`expand`s to the requested broadcast shape.
+    This guarantees tensors used in formulas have identical shapes for safe
+    elementwise math.
+  - Added inline comments and assertions in `model.py` to document tensor
+    shapes at key points and prevent silent mismatches.
+
+- Common pitfalls in UNet-based diffusion models:
+  - Be explicit about channel counts when concatenating skip connections.
+  - Prefer adding projected timestep embeddings (same channel count) over
+    concatenation unless you also adjust later layers to accept increased
+    channels.
+  - Always check that model output shape matches the training target (noise)
+    before computing the loss.
+

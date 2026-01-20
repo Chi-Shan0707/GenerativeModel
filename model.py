@@ -42,6 +42,11 @@ class SmallUNet(nn.Module):
 
         # Bottleneck
         self.mid = ConvBlock(channels * 4, channels * 4)
+        # Project time embedding to match bottleneck channels so we can add it
+        # to the bottleneck feature map rather than concatenating. This avoids
+        # channel mismatches downstream when decoder expects a specific
+        # number of channels.
+        self.temb_proj = nn.Linear(time_emb_dim, channels * 4)
 
         # Decoder
         self.up2 = nn.ConvTranspose2d(channels * 4, channels * 2, 4, 2, 1)  # 7->14
@@ -69,23 +74,31 @@ class SmallUNet(nn.Module):
         d2 = self.down2(c2)  # (B,4C,7,7)
         c3 = self.conv3(d2)
 
-        # Add time embedding to bottleneck by reshaping & broadcasting
-        # This lets the network modulate features depending on timestep.
-        b = self.mid(c3)
-        B, C, H, W = b.shape
-        temb_spatial = temb.view(B, -1, 1, 1).expand(-1, -1, H, W)
-        # If temb_dim != C, project or truncate by conv; here we concatenate
-        # to keep things simple and explicit.
-        b = torch.cat([b, temb_spatial[:, :C, :, :]], dim=1)
+        # Add time embedding to bottleneck by projecting to the same number
+        # of channels as the bottleneck and adding (not concatenating).
+        # This keeps the channel dimensions consistent for the decoder.
+        b = self.mid(c3)  # b: (B, channels*4, 7, 7)
+        B, C_b, H, W = b.shape
+        # Project timestep embedding to (B, C_b) then reshape to (B, C_b, 1, 1)
+        temb_proj = self.temb_proj(temb)  # (B, C_b)
+        temb_proj = temb_proj.view(B, C_b, 1, 1)
+        # Broadcast and add - this modulates the bottleneck features by t.
+        b = b + temb_proj
+
+        # Sanity check: ensure channel dimensions match expected decoder input
+        # up2 expects input channels == channels*4
+        assert b.shape[1] == C_b == (self.temb_proj.out_features if hasattr(self.temb_proj, 'out_features') else C_b)
 
         # Decoder
-        u2 = self.up2(b)
+        u2 = self.up2(b)  # u2: (B, channels*2, 14, 14)
         # Skip connection from c2
+        # c2 has shape (B, channels*2, 14, 14) so concatenation gives (B,4C,14,14)
         u2 = torch.cat([u2, c2], dim=1)
-        u2 = self.conv4(u2)
-        u1 = self.up1(u2)
+        u2 = self.conv4(u2)  # -> (B, channels*2, 14, 14)
+        u1 = self.up1(u2)  # -> (B, channels, 28, 28)
+        # c1 has shape (B, channels, 28, 28) so concat gives (B, 2*channels,28,28)
         u1 = torch.cat([u1, c1], dim=1)
-        u1 = self.conv5(u1)
+        u1 = self.conv5(u1)  # -> (B, channels, 28, 28)
 
         out = self.final(u1)
         return out

@@ -43,10 +43,16 @@ class DDPM:
         """Extract values from a 1-D tensor `arr` for given batch `timesteps`.
         Then reshape to `broadcast_shape` for broadcasting in computations.
         """
-        out = arr.gather(-1, timesteps).float()
-        while len(out.shape) < len(broadcast_shape):
-            out = out.unsqueeze(-1)
-        return out.view(*broadcast_shape)
+        # `arr` is 1-D with length `timesteps` (T). We want to select the
+        # value arr[t] for each batch element t in `timesteps` and then
+        # reshape/broadcast to `broadcast_shape` (e.g. (B,1,28,28)).
+        # Using direct indexing arr[timesteps] is simpler and returns a
+        # (B,) tensor which we then reshape and expand.
+        out = arr[timesteps].float()
+        # reshape to (B, 1, 1, ...) so it can broadcast to spatial dims
+        expand_dims = [out.shape[0]] + [1] * (len(broadcast_shape) - 1)
+        out = out.view(*expand_dims).expand(*broadcast_shape)
+        return out
 
     def q_sample(self, x_start, t, noise=None):
         """
@@ -63,7 +69,10 @@ class DDPM:
         sqrt_one_minus_alpha_cumprod_t = self._extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
 
         # Equation: x_t = sqrt(alpha_cumprod_t) * x_0 + sqrt(1 - alpha_cumprod_t) * noise
-        return sqrt_alpha_cumprod_t * x_start + sqrt_one_minus_alpha_cumprod_t * noise
+        x_t = sqrt_alpha_cumprod_t * x_start + sqrt_one_minus_alpha_cumprod_t * noise
+        # Sanity: shapes must match (B, C, H, W)
+        assert x_t.shape == x_start.shape == noise.shape
+        return x_t
 
     def p_mean_variance(self, model, x_t, t):
         """
@@ -77,6 +86,9 @@ class DDPM:
         t_emb = sinusoidal_timestep_embedding(t, 128)
         t_emb = t_emb.to(x_t.device)
         eps_theta = model(x_t, t_emb)
+
+        # Ensure model predicted noise has same shape as x_t
+        assert eps_theta.shape == x_t.shape, f"Model output shape {eps_theta.shape} != x_t shape {x_t.shape}"
 
         # Predict x0: use analytic formula from the paper
         sqrt_recip_alphas_cumprod_t = 1.0 / self._extract(self.sqrt_alphas_cumprod, t, x_t.shape)
@@ -100,6 +112,8 @@ class DDPM:
         posterior_mean = posterior_mean_coef1 * x0_pred + posterior_mean_coef2 * x_t
 
         posterior_variance_t = self._extract(self.posterior_variance, t, x_t.shape)
+        # posterior_variance_t should broadcast to x_t
+        assert posterior_variance_t.shape == x_t.shape
         return posterior_mean, posterior_variance_t, x0_pred
 
     def p_sample(self, model, x_t, t):
@@ -141,6 +155,9 @@ class DDPM:
         # model prediction
         t_emb = sinusoidal_timestep_embedding(t, 128).to(x_start.device)
         eps_theta = model(x_t, t_emb)
+
+        # Ensure shapes align
+        assert eps_theta.shape == noise.shape == x_t.shape
 
         # MSE loss between true noise and predicted noise
         return F.mse_loss(eps_theta, noise)
